@@ -1,0 +1,7 @@
+{
+  "name": "daily_folder_summary",
+  "description": "สรุปสถานะโฟลเดอร์งานประจำวัน: ไฟล์ใหม่ใน inbox, งานค้างใน projects แล้วเขียนรายงานสั้น",
+  "type": "prompt",
+  "category": "Workflow",
+  "prompt": "prompt.md"
+}

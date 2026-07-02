@@ -1,0 +1,7 @@
+{
+  "name": "content_week_planner",
+  "description": "วางแผนคอนเทนต์รายสัปดาห์: ถามข้อมูลที่จำเป็น แล้วสร้างตารางโพสต์ 7 วันพร้อมหัวข้อและ hook",
+  "type": "prompt",
+  "category": "Workflow",
+  "prompt": "prompt.md"
+}

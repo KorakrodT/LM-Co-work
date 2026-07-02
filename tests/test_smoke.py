@@ -777,5 +777,307 @@ def test_pinned_ip_resolver_caches_per_host():
         assert calls == ["example.com"], f"ต้อง resolve แค่ครั้งเดียว แต่ได้ {calls!r}"
 
 
+# --------------------------------------------------------------------------
+# F1: Memory files (_agent.md/_memory.md) + tool remember
+# --------------------------------------------------------------------------
+def test_workspace_context_empty_when_no_memory_files(tmp_path):
+    """ไม่มี _agent.md/_memory.md -> ต้องคืน '' (ไม่เปลืองบริบทโมเดล)."""
+    _stub_optional_deps()
+    import tools as T
+    T.set_workspace(str(tmp_path))
+    assert T.workspace_context() == ""
+
+
+def test_workspace_context_reads_agent_and_memory(tmp_path):
+    _stub_optional_deps()
+    import tools as T
+    T.set_workspace(str(tmp_path))
+    (tmp_path / T.AGENT_FILE).write_text("ตอบสั้นๆ เสมอ", encoding="utf-8")
+    (tmp_path / T.MEMORY_FILE).write_text("- ลูกค้าหลักคือร้าน A", encoding="utf-8")
+    ctx = T.workspace_context()
+    assert "ตอบสั้นๆ เสมอ" in ctx
+    assert "ลูกค้าหลักคือร้าน A" in ctx
+    assert T.AGENT_FILE in ctx and T.MEMORY_FILE in ctx
+
+
+def test_workspace_context_caps_memory_size(tmp_path):
+    """_memory.md ใหญ่เกิน cap -> ต้องตัดหัว (เก็บบันทึกล่าสุดท้ายไฟล์ไว้)."""
+    _stub_optional_deps()
+    import tools as T
+    T.set_workspace(str(tmp_path))
+    lines = [f"- บันทึกที่ {i}" for i in range(500)]
+    (tmp_path / T.MEMORY_FILE).write_text("\n".join(lines), encoding="utf-8")
+    ctx = T.workspace_context()
+    assert len(ctx) < T.MEMORY_MAX_CHARS + 500          # ถูก cap จริง
+    assert "- บันทึกที่ 499" in ctx                      # อันล่าสุดต้องรอด
+    assert "- บันทึกที่ 0" not in ctx                    # อันเก่าสุดถูกตัด
+
+
+def test_remember_is_write_tool_and_becomes_proposal(tmp_path):
+    """remember ต้องอยู่ใน WRITE_TOOLS และถูกดักเป็น proposal (ไม่เขียนทันที)."""
+    _stub_optional_deps()
+    import tools as T
+    server = importlib.import_module("server")
+    T.set_workspace(str(tmp_path))
+    assert "remember" in T.WRITE_TOOLS
+    used, proposals = [], []
+    msg = server._handle_tool_call("remember", {"text": "ชอบตอบสั้นๆ"}, used, proposals,
+                                   skill_names=set())
+    assert "รอผู้ใช้" in msg
+    assert len(proposals) == 1
+    assert proposals[0]["path"] == T.MEMORY_FILE
+    assert "ชอบตอบสั้นๆ" in proposals[0]["content"]
+    # ยังไม่เขียนจริงจนกว่าจะ apply
+    assert not (tmp_path / T.MEMORY_FILE).exists()
+
+
+def test_build_memory_content_appends_and_caps(tmp_path):
+    _stub_optional_deps()
+    import tools as T
+    T.set_workspace(str(tmp_path))
+    (tmp_path / T.MEMORY_FILE).write_text("- [2026-01-01] ของเดิม", encoding="utf-8")
+    new = T.build_memory_content("ของใหม่")
+    assert "ของเดิม" in new and "ของใหม่" in new
+    assert new.index("ของเดิม") < new.index("ของใหม่")   # append ต่อท้าย
+    assert len(T.build_memory_content("x" * 10000)) <= T.MEMORY_MAX_CHARS
+
+
+def test_run_agent_injects_workspace_context(monkeypatch, tmp_path):
+    """system prompt ของ run_agent ต้องมีเนื้อหา _agent.md/_memory.md ต่อท้าย."""
+    _stub_optional_deps()
+    import tools as T
+    server = importlib.import_module("server")
+    T.set_workspace(str(tmp_path))
+    (tmp_path / T.AGENT_FILE).write_text("กฎพิเศษ: เรียกผู้ใช้ว่าบอส", encoding="utf-8")
+
+    captured = {}
+
+    def fake_chat(base_url, api_key, model, messages, tools):
+        captured["system"] = messages[0]["content"]
+        return {"choices": [{"message": {"content": "ok", "tool_calls": None}}]}
+
+    monkeypatch.setattr(server, "_openai_chat", fake_chat)
+    server.run_agent("general", [{"role": "user", "content": "สวัสดี"}], "m")
+    assert "กฎพิเศษ: เรียกผู้ใช้ว่าบอส" in captured["system"]
+
+
+# --------------------------------------------------------------------------
+# F3: init-workspace route
+# --------------------------------------------------------------------------
+def test_init_workspace_route_registered():
+    _stub_optional_deps()
+    server = importlib.import_module("server")
+    assert "/api/init-workspace" in server.Handler._POST_ROUTE_TABLE
+
+
+def test_init_workspace_creates_structure_without_overwrite(tmp_path):
+    _stub_optional_deps()
+    import tools as T
+    server = importlib.import_module("server")
+    T.set_workspace(str(tmp_path))
+    # มี _agent.md อยู่แล้ว — ต้องไม่ถูกทับ
+    (tmp_path / T.AGENT_FILE).write_text("ของเดิมห้ามหาย", encoding="utf-8")
+
+    h = object.__new__(server.Handler)
+    sent = {}
+    h._send = lambda code, body, *a, **k: sent.update(code=code, body=body)
+    h._route_init_workspace({})
+
+    assert sent["code"] == 200
+    data = json.loads(sent["body"])
+    assert data["ok"]
+    for d in ("inbox", "projects", "archive"):
+        assert (tmp_path / d).is_dir()
+    assert (tmp_path / T.MEMORY_FILE).is_file()
+    assert (tmp_path / T.AGENT_FILE).read_text(encoding="utf-8") == "ของเดิมห้ามหาย"
+    assert T.AGENT_FILE in data["skipped"]
+
+
+# --------------------------------------------------------------------------
+# รอบ 2: SEC-6 (MCP confirm gate) + F4 (mcp routes) + OBS-1 (file logging)
+# --------------------------------------------------------------------------
+def test_mcp_tool_requires_confirmation(monkeypatch):
+    """SEC-6: MCP tool ต้องถูกดักเป็น skill_confirm proposal ก่อนรันครั้งแรก."""
+    _stub_optional_deps()
+    import tools as T
+    import skills_loader as SL
+    server = importlib.import_module("server")
+    monkeypatch.setitem(T.mcp_manager.tool_mapping, "srv_do_thing", "srv")
+    SL.reset_confirmed_skills()
+    used, proposals = [], []
+    msg = server._handle_tool_call("srv_do_thing", {"x": 1}, used, proposals,
+                                   skill_names=set())
+    assert "ยังไม่ได้รับการยืนยัน" in msg
+    assert proposals and proposals[0]["type"] == "skill_confirm"
+    assert proposals[0]["name"] == "srv_do_thing"
+    # หลัง confirm -> รันจริง (client ไม่มีอยู่ -> ได้ error string จาก mcp_manager ไม่ใช่ proposal)
+    SL.confirm_skill("srv_do_thing")
+    used2, proposals2 = [], []
+    out = server._handle_tool_call("srv_do_thing", {"x": 1}, used2, proposals2,
+                                   skill_names=set())
+    assert not proposals2
+    assert "not running" in out or "Error" in out
+    SL.reset_confirmed_skills()
+
+
+def test_tools_import_does_not_autoload_mcp():
+    """QUAL-5: import tools ต้องไม่ spawn MCP subprocess เอง (โหลดผ่าน init_mcp เท่านั้น)."""
+    _stub_optional_deps()
+    import tools as T
+    src = open(os.path.join(str(ROOT), "tools.py"), encoding="utf-8").read()
+    head = src.split("def init_mcp", 1)[0]
+    assert "load_config(" not in head, "ห้ามเรียก load_config ที่ module level ของ tools.py"
+    assert callable(T.init_mcp) and callable(T.is_mcp_tool)
+
+
+def test_mcp_routes_registered():
+    _stub_optional_deps()
+    server = importlib.import_module("server")
+    table = server.Handler._POST_ROUTE_TABLE
+    for r in ("/api/mcp-status", "/api/mcp-reload", "/api/mcp-save", "/api/mcp-delete"):
+        assert r in table, f"missing {r}"
+        assert hasattr(server.Handler, table[r])
+
+
+def test_mcp_save_and_delete_roundtrip(monkeypatch, tmp_path):
+    """F4: save เขียน mcp.json ถูกโครงสร้าง (atomic) และ delete เอาออกจริง."""
+    _stub_optional_deps()
+    import tools as T
+    server = importlib.import_module("server")
+    cfg_path = str(tmp_path / "mcp.json")
+    monkeypatch.setattr(T, "MCP_CONFIG_PATH", cfg_path)
+    monkeypatch.setattr(T, "init_mcp", lambda: 0)   # อย่า spawn จริงใน test
+
+    h = object.__new__(server.Handler)
+    sent = {}
+    h._send = lambda code, body, *a, **k: sent.update(code=code, body=body)
+
+    h._route_mcp_save({"id": "my tool!", "command": "npx",
+                       "args": "-y some-mcp-server"})
+    data = json.loads(sent["body"])
+    assert data["ok"] and data["id"] == "my_tool"   # id ถูก slug
+    cfg = json.loads(open(cfg_path, encoding="utf-8").read())
+    assert cfg["mcpServers"]["my_tool"]["command"] == "npx"
+    assert cfg["mcpServers"]["my_tool"]["args"] == ["-y", "some-mcp-server"]
+
+    h._route_mcp_delete({"id": "my_tool"})
+    assert json.loads(sent["body"])["ok"]
+    cfg = json.loads(open(cfg_path, encoding="utf-8").read())
+    assert "my_tool" not in cfg["mcpServers"]
+
+    # ลบซ้ำ -> ok=False ไม่ระเบิด
+    h._route_mcp_delete({"id": "my_tool"})
+    assert not json.loads(sent["body"])["ok"]
+
+
+def test_mcp_save_rejects_missing_fields(monkeypatch, tmp_path):
+    _stub_optional_deps()
+    import tools as T
+    server = importlib.import_module("server")
+    monkeypatch.setattr(T, "MCP_CONFIG_PATH", str(tmp_path / "mcp.json"))
+    monkeypatch.setattr(T, "init_mcp", lambda: 0)
+    h = object.__new__(server.Handler)
+    sent = {}
+    h._send = lambda code, body, *a, **k: sent.update(code=code, body=body)
+    h._route_mcp_save({"id": "", "command": ""})
+    assert not json.loads(sent["body"])["ok"]
+    assert not (tmp_path / "mcp.json").exists()
+
+
+def test_file_logging_writes_to_data_dir(monkeypatch, tmp_path):
+    """OBS-1: _setup_file_logging ต้องสร้าง data/app.log แล้ว log ไหลลงไฟล์จริง."""
+    _stub_optional_deps()
+    import logging as _logging
+    import data_store as DS
+    server = importlib.import_module("server")
+    monkeypatch.setattr(DS, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "_FILE_LOG_READY", False)
+    server._setup_file_logging()
+    log_path = tmp_path / "app.log"
+    _logging.getLogger("obs1test").warning("ทดสอบ log ลงไฟล์ 🤖")
+    # หา handler ที่เพิ่งเพิ่ม flush แล้วถอดออก (กัน handler รั่วไป test อื่น)
+    root = _logging.getLogger()
+    added = [h for h in root.handlers
+             if getattr(h, "baseFilename", "") == str(log_path)]
+    assert added, "ไม่พบ RotatingFileHandler ที่ชี้ไป app.log"
+    for h in added:
+        h.flush()
+        root.removeHandler(h)
+        h.close()
+    assert log_path.is_file()
+    assert "ทดสอบ log ลงไฟล์" in log_path.read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------
+# รอบ 3: F5 (Scheduled tasks)
+# --------------------------------------------------------------------------
+def test_schedules_key_allowed_in_data_store():
+    _stub_optional_deps()
+    import data_store as DS
+    assert "schedules" in DS.ALLOWED
+
+
+def test_sched_due_logic():
+    """_sched_due: เช็ค enabled / เวลา / วัน / last_run ครบทุกกิ่ง."""
+    _stub_optional_deps()
+    import datetime as dt
+    server = importlib.import_module("server")
+    # อังคาร 2026-07-07 เวลา 09:00 (weekday=1)
+    now = dt.datetime(2026, 7, 7, 9, 0)
+    base = {"time": "08:30", "prompt": "x", "enabled": True}
+    assert server._sched_due(dict(base), now)                          # เลยเวลาแล้ว -> รัน
+    assert not server._sched_due(dict(base, time="09:30"), now)        # ยังไม่ถึงเวลา
+    assert not server._sched_due(dict(base, enabled=False), now)       # ปิดอยู่
+    assert not server._sched_due(dict(base, last_run="2026-07-07"), now)  # รันวันนี้แล้ว
+    assert server._sched_due(dict(base, last_run="2026-07-06"), now)   # รันเมื่อวาน -> รันได้
+    assert not server._sched_due(dict(base, days=[0, 2]), now)         # วันนี้ (อังคาร=1) ไม่อยู่ใน days
+    assert server._sched_due(dict(base, days=[1]), now)                # วันตรง
+    assert not server._sched_due(dict(base, time="เช้าๆ"), now)         # เวลาผิดรูปแบบ
+    assert not server._sched_due(dict(base, time=""), now)
+
+
+def test_run_schedule_writes_report(monkeypatch, tmp_path):
+    """_run_schedule ต้องเขียนรายงานลง reports/ และแจ้งเตือนเมื่อมี proposal ที่ไม่ได้เขียน."""
+    _stub_optional_deps()
+    import tools as T
+    server = importlib.import_module("server")
+
+    def fake_run_agent(agent_key, history, model, cowork=False, provider=None):
+        assert history[0]["content"] == "สรุปหน่อย"
+        return {"reply": "นี่คือสรุปประจำวัน", "tools": [],
+                "proposals": [{"path": "x.txt", "content": "y"}]}
+
+    monkeypatch.setattr(server, "run_agent", fake_run_agent)
+    s = {"id": "s1", "title": "งานเช้า", "time": "08:00", "prompt": "สรุปหน่อย",
+         "workspace": str(tmp_path)}
+    path = server._run_schedule(s)
+    assert path.startswith("reports/")
+    full = tmp_path / path
+    assert full.is_file()
+    text = full.read_text(encoding="utf-8")
+    assert "นี่คือสรุปประจำวัน" in text
+    assert "ไม่เขียนไฟล์ให้" in text          # เตือนเรื่อง proposal ค้าง
+
+
+def test_schedule_run_route_registered():
+    _stub_optional_deps()
+    server = importlib.import_module("server")
+    table = server.Handler._POST_ROUTE_TABLE
+    assert "/api/schedule-run" in table
+    assert hasattr(server.Handler, table["/api/schedule-run"])
+
+
+def test_schedule_run_route_unknown_id(monkeypatch):
+    _stub_optional_deps()
+    import data_store as DS
+    server = importlib.import_module("server")
+    monkeypatch.setattr(DS, "load", lambda key, default=None: [])
+    h = object.__new__(server.Handler)
+    sent = {}
+    h._send = lambda code, body, *a, **k: sent.update(code=code, body=body)
+    h._route_schedule_run({"id": "no_such"})
+    assert not json.loads(sent["body"])["ok"]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

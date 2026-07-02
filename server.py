@@ -12,6 +12,7 @@ server.py — UI แบบหน้าต่างสไตล์ Claude desktop
 
 from __future__ import annotations
 
+import datetime as _dt
 import io
 import json
 import logging
@@ -73,6 +74,40 @@ import skills_loader as SL
 import agent_store as AG
 import data_store as DS
 import winproc  # QUAL-1: no_window_kwargs() ที่ใช้ร่วมกับ tools.py
+
+# OBS-1: log ลงไฟล์ data/app.log ด้วย — โหมด .exe (--windowed) ไม่มีคอนโซล
+# ถ้าไม่มีไฟล์ log แปลว่า warning/audit trail (SEC-3) และ traceback (D2) หายเงียบหมด
+_FILE_LOG_READY = False
+
+
+def _setup_file_logging() -> None:
+    """เพิ่ม RotatingFileHandler ที่ data/app.log (1MB × เก็บย้อนหลัง 3 ไฟล์).
+
+    คอนโซลยังแสดงเฉพาะ WARNING+ เหมือนเดิม แต่ไฟล์เก็บตั้งแต่ INFO ขึ้นไป.
+    """
+    global _FILE_LOG_READY
+    if _FILE_LOG_READY:
+        return
+    try:
+        from logging.handlers import RotatingFileHandler
+        os.makedirs(DS.DATA_DIR, exist_ok=True)
+        fh = RotatingFileHandler(
+            os.path.join(DS.DATA_DIR, "app.log"),
+            maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+        root = logging.getLogger()
+        for h in root.handlers:          # handler คอนโซลเดิม: คุมระดับไว้ที่ WARNING+
+            h.setLevel(logging.WARNING)
+        root.addHandler(fh)
+        root.setLevel(logging.INFO)      # ให้ INFO ไหลถึง file handler ได้
+        _FILE_LOG_READY = True
+    except Exception:  # noqa: BLE001 — log ไฟล์เป็นของเสริม อย่าทำแอปพังเพราะมัน
+        _log.debug("_setup_file_logging: ตั้ง file logging ไม่สำเร็จ", exc_info=True)
+
+
+_setup_file_logging()
 
 # ----------------------------- LM Studio backend -----------------------------
 # แอปนี้คุยกับโมเดลผ่าน LM Studio (เซิร์ฟเวอร์ OpenAI-compatible)
@@ -224,7 +259,7 @@ def ensure_lmstudio(timeout: int = 30) -> bool:
 
 # ----------------------------- agent core -----------------------------
 COWORK_TOOLS = {"list_files", "read_file", "write_file", "fetch_url",
-                "check_audio_integrity", "check_ffmpeg", "install_ffmpeg"}
+                "check_audio_integrity", "check_ffmpeg", "install_ffmpeg", "remember"}
 # SEC-4: เครื่องมือที่ "เปลี่ยนแปลงระบบ" (ติดตั้งซอฟต์แวร์ ฯลฯ) ต้องผ่านการยืนยันจาก
 # ผู้ใช้ก่อนรันจริงเหมือน skill ใหม่ — โมเดลตัดสินใจเรียกเองทันทีไม่ได้อีกต่อไป
 CONFIRM_TOOLS = {"install_ffmpeg"}
@@ -280,8 +315,14 @@ def _handle_tool_call(fname, args, used_tools, proposals, skill_names=None):
     """
     used_tools.append(fname)
     if fname in T.WRITE_TOOLS:
-        path = args.get("path", "untitled.txt")
-        content = args.get("content", "")
+        if fname == "remember":
+            # F1: แปลง remember(text) เป็น proposal เขียน _memory.md ฉบับเต็ม —
+            # ผู้ใช้เห็น preview ความจำทั้งไฟล์ก่อนกดยืนยัน (reuse flow ของ write_file)
+            path = T.MEMORY_FILE
+            content = T.build_memory_content(args.get("text", ""))
+        else:
+            path = args.get("path", "untitled.txt")
+            content = args.get("content", "")
         proposals.append({"path": path, "content": content, "exists": T.file_exists(path)})
         return (f"เสนอบันทึกไฟล์ '{path}' แล้ว — กำลังรอผู้ใช้กดยืนยันใน UI "
                 f"(ยังไม่เขียนจริง)")
@@ -289,7 +330,9 @@ def _handle_tool_call(fname, args, used_tools, proposals, skill_names=None):
     if skill_names is None:
         skill_names = {s["name"] for s in T.skills_list()}
     is_skill = fname in skill_names
-    if is_skill or fname in CONFIRM_TOOLS:
+    # SEC-6: MCP tool คือโค้ดภายนอกที่ทำอะไรก็ได้ — ต้องผ่าน confirm ครั้งแรกเหมือน skill
+    is_mcp = T.is_mcp_tool(fname)
+    if is_skill or is_mcp or fname in CONFIRM_TOOLS:
         if not SL.is_confirmed(fname):
             proposals.append({"type": "skill_confirm", "name": fname, "args": args})
             return (f"⚠️ '{fname}' ยังไม่ได้รับการยืนยัน — "
@@ -297,8 +340,8 @@ def _handle_tool_call(fname, args, used_tools, proposals, skill_names=None):
         # SEC-3: หลัง confirm แล้วจะไม่ถูกถามซ้ำอีกในเซสชันนี้ — log argument ทุกครั้งที่รัน
         # (ไม่ใช่แค่ครั้งแรก) ไว้เป็น audit trail กันกรณีมี prompt injection สั่งเรียกด้วย
         # argument ผิดปกติหลังจากที่เคยยืนยันไปแล้ว
-        _log.warning("%s run (confirmed): %s args=%r",
-                     "skill" if is_skill else "system tool", fname, args)
+        kind = "skill" if is_skill else ("mcp tool" if is_mcp else "system tool")
+        _log.warning("%s run (confirmed): %s args=%r", kind, fname, args)
     return _run(fname, args)
 
 
@@ -415,6 +458,10 @@ def run_agent(agent_key: str, history: list, model: str,
     catalog = T.skills_catalog(allowed_cats)
     if catalog:
         sys_prompt += "\n\n" + catalog
+    # F1: บริบทประจำโฟลเดอร์งาน (_agent.md/_memory.md) — ว่าง = ไม่เปลืองบริบทโมเดล
+    ws_ctx = T.workspace_context()
+    if ws_ctx:
+        sys_prompt += "\n\n" + ws_ctx
     tool_schemas = schemas_for(agent, cowork)
     used_tools: list[str] = []
     proposals: list[dict] = []
@@ -482,6 +529,85 @@ def run_agent(agent_key: str, history: list, model: str,
 
 def _run(name: str, args: dict) -> str:
     return T.run_tool(name, args)
+
+
+# ------------------ F5: งานตามเวลา (Scheduled tasks) ------------------
+# เก็บใน data/schedules.json (ผ่าน data_store key "schedules") รูปแบบรายการละ dict:
+#   {id, title, time:"HH:MM", days:[0-6]?, prompt, agent, workspace, enabled,
+#    last_run:"YYYY-MM-DD", last_result}
+# ข้อจำกัดที่ตั้งใจ: รันเฉพาะตอนแอปเปิดอยู่ (ไม่ใช่ Windows service) และรันทีละงาน
+_sched_running = threading.Lock()
+
+
+def _sched_due(s: dict, now: _dt.datetime | None = None) -> bool:
+    """งานถึงกำหนดหรือยัง: enabled + เลยเวลา HH:MM ของวันนี้ + วันตรง + ยังไม่รันวันนี้."""
+    if not s.get("enabled", True):
+        return False
+    now = now or _dt.datetime.now()
+    if s.get("last_run") == now.strftime("%Y-%m-%d"):
+        return False
+    days = s.get("days")
+    if days and now.weekday() not in days:
+        return False
+    t = (s.get("time") or "").strip()
+    if not _re.fullmatch(r"\d{1,2}:\d{2}", t):
+        return False
+    hh, mm = t.split(":")
+    return now.hour * 60 + now.minute >= int(hh) * 60 + int(mm)
+
+
+def _run_schedule(s: dict) -> str:
+    """รันงานหนึ่งรายการแบบ headless แล้วเขียนรายงานลง reports/ ในโฟลเดอร์งานของงานนั้น.
+
+    write_file proposals จากตัว agent จะไม่ถูกเขียน (ไม่มีใครกดยืนยัน) — รายงานจะบอก
+    ผู้ใช้แทน. ผลลัพธ์หลัก (reply) ถูกเขียนตรงโดย server เพราะผู้ใช้ opt-in ตอนตั้งงานแล้ว.
+    """
+    title = (s.get("title") or s.get("id") or "งาน").strip()
+    _log.info("scheduled task start: %s", title)
+    T.set_cowork(True)   # ให้ตั้ง workspace ที่ผู้ใช้เลือกไว้ได้ (ยังกัน root/ระบบเสมอ)
+    T.set_workspace(s.get("workspace") or None)
+    res = run_agent(s.get("agent") or DEFAULT_AGENT,
+                    [{"role": "user", "content": s.get("prompt") or ""}],
+                    "", cowork=True)
+    reply = res.get("reply", "")
+    note = ""
+    if res.get("proposals"):
+        note = ("\n\n---\n⚠️ งานนี้พยายามสร้าง/แก้ไฟล์ "
+                f"{len(res['proposals'])} รายการ แต่โหมดอัตโนมัติไม่เขียนไฟล์ให้ — "
+                "เปิดแอปแล้วสั่งเองถ้าต้องการ")
+    stamp = _dt.datetime.now().strftime("%Y-%m-%d")
+    slug = _re.sub(r"[^0-9A-Za-zก-๙_-]", "_", title)[:40] or "task"
+    path = f"reports/{stamp}-{slug}.md"
+    T.write_file(path, f"# {title} — {stamp}\n\n{reply}{note}\n")
+    _log.info("scheduled task done: %s -> %s", title, path)
+    return path
+
+
+def _scheduler_loop() -> None:
+    """เช็คทุก 30 วิ — งานไหนถึงกำหนดก็รัน (ทีละงาน) แล้วบันทึก last_run/last_result."""
+    while True:
+        time.sleep(30)
+        try:
+            items = DS.load("schedules", []) or []
+            changed = False
+            for s in items:
+                if not isinstance(s, dict) or not _sched_due(s):
+                    continue
+                if not _sched_running.acquire(blocking=False):
+                    break            # มีงานกำลังรันอยู่ — รอรอบหน้า
+                try:
+                    s["last_run"] = _dt.datetime.now().strftime("%Y-%m-%d")
+                    s["last_result"] = _run_schedule(s)
+                except Exception as e:  # noqa: BLE001
+                    s["last_result"] = f"ผิดพลาด: {e}"
+                    _log.warning("scheduled task '%s' failed", s.get("title"), exc_info=True)
+                finally:
+                    _sched_running.release()
+                changed = True
+            if changed:
+                DS.save("schedules", items)
+        except Exception:  # noqa: BLE001
+            _log.warning("scheduler loop error", exc_info=True)
 
 
 # ------------------ งานตรวจไฟล์ (ปุ่มใน UI, ไม่พึ่ง AI) ------------------
@@ -714,6 +840,9 @@ class Handler(BaseHTTPRequestHandler):
         catalog = T.skills_catalog(allowed_cats)
         if catalog:
             sys_prompt += "\n\n" + catalog
+        ws_ctx = T.workspace_context()  # F1: ให้ตรงกับ run_agent
+        if ws_ctx:
+            sys_prompt += "\n\n" + ws_ctx
         tool_schemas = schemas_for(agent, p.get("cowork", False))
         provider = p.get("provider")
         if provider and provider.get("base_url"):
@@ -914,6 +1043,154 @@ class Handler(BaseHTTPRequestHandler):
             "message": (f"นำเข้าเป็น agent '{key}' แล้ว") if ok else msg,
             "agents": AG.list_agents()}, ensure_ascii=False))
 
+    def _route_init_workspace(self, p: dict) -> None:
+        """F3: จัดโครงสร้างโฟลเดอร์งานเริ่มต้น (สร้างเฉพาะที่ยังไม่มี — ไม่ทับของเดิม).
+
+        เขียนตรงได้โดยไม่ผ่าน proposal flow เพราะ trigger คือผู้ใช้กดปุ่มเอง
+        (ไม่ใช่ AI ตัดสินใจ) และไม่ overwrite ไฟล์ใดๆ ที่มีอยู่แล้ว.
+        """
+        if p.get("workspace"):
+            T.set_workspace(p["workspace"])
+        base = os.path.abspath(T.WORKSPACE)
+        created: list[str] = []
+        skipped: list[str] = []
+        for d in ("inbox", "projects", "archive"):
+            full = os.path.join(base, d)
+            if os.path.isdir(full):
+                skipped.append(d + "/")
+            else:
+                os.makedirs(full, exist_ok=True)
+                created.append(d + "/")
+        templates = {
+            T.AGENT_FILE: (
+                "# คำสั่งประจำโฟลเดอร์งาน\n\n"
+                "AI อ่านไฟล์นี้อัตโนมัติทุกครั้งก่อนเริ่มตอบในโฟลเดอร์นี้ — เขียนกฎ/บริบทของงาน เช่น\n\n"
+                "- ตอบภาษาไทย กระชับ ตรงประเด็น\n"
+                "- งานในโฟลเดอร์นี้คือ: (เติมเอง)\n"
+                "- ไฟล์งานใหม่เข้าที่ inbox/ งานที่ทำอยู่ใน projects/ งานจบแล้วย้ายไป archive/\n\n"
+                f"(อ่านสูงสุด {T.AGENT_MAX_CHARS} ตัวอักษรแรก — เขียนเรื่องสำคัญไว้บนสุด)\n"
+            ),
+            T.MEMORY_FILE: (
+                "# ความจำของโฟลเดอร์นี้\n\n"
+                "AI เพิ่มบันทึกที่นี่ผ่านเครื่องมือ remember (ถามยืนยันก่อนทุกครั้ง) "
+                "และคุณแก้/ลบเองได้ตามใจ\n"
+            ),
+        }
+        for name, content in templates.items():
+            full = os.path.join(base, name)
+            if os.path.isfile(full):
+                skipped.append(name)
+            else:
+                with open(full, "w", encoding="utf-8") as f:
+                    f.write(content)
+                created.append(name)
+        self._send(200, json.dumps({"ok": True, "created": created, "skipped": skipped},
+                                   ensure_ascii=False))
+
+    # ------------------------------------------------------------------
+    # F4: MCP Connectors — จัดการ mcp.json ผ่าน UI
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_mcp_config() -> dict:
+        if os.path.isfile(T.MCP_CONFIG_PATH):
+            try:
+                with open(T.MCP_CONFIG_PATH, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                if isinstance(cfg, dict):
+                    return cfg
+            except Exception:  # noqa: BLE001
+                _log.warning("mcp.json อ่านไม่ได้/ผิดรูปแบบ — เริ่มจาก config ว่าง", exc_info=True)
+        return {}
+
+    @staticmethod
+    def _save_mcp_config(cfg: dict) -> None:
+        # เขียนแบบ atomic (tmp + os.replace) — ดับกลางคันไฟล์ไม่พัง
+        tmp = T.MCP_CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, T.MCP_CONFIG_PATH)
+
+    def _route_mcp_status(self, p: dict) -> None:  # noqa: ARG002
+        self._send(200, json.dumps({
+            "ok": True,
+            "config_path": T.MCP_CONFIG_PATH,
+            "exists": os.path.isfile(T.MCP_CONFIG_PATH),
+            "servers": T.mcp_manager.status(),
+        }, ensure_ascii=False))
+
+    def _route_mcp_reload(self, p: dict) -> None:  # noqa: ARG002
+        n = T.init_mcp()
+        self._send(200, json.dumps({"ok": True, "tools": n,
+                                    "servers": T.mcp_manager.status()}, ensure_ascii=False))
+
+    def _route_mcp_save(self, p: dict) -> None:
+        """เพิ่ม/แก้ MCP server หนึ่งตัวใน mcp.json แล้ว reload."""
+        sid = _re.sub(r"[^a-zA-Z0-9_-]", "_", (p.get("id") or "").strip()).strip("_")
+        command = (p.get("command") or "").strip()
+        if not sid or not command:
+            self._send(200, json.dumps({"ok": False, "message": "ต้องระบุ id และ command"},
+                                       ensure_ascii=False))
+            return
+        args = p.get("args") or []
+        if isinstance(args, str):
+            args = args.split()
+        env = p.get("env") if isinstance(p.get("env"), dict) else {}
+        cfg = self._load_mcp_config()
+        cfg.setdefault("mcpServers", {})[sid] = {
+            "command": command, "args": [str(a) for a in args], "env": env}
+        self._save_mcp_config(cfg)
+        n = T.init_mcp()
+        self._send(200, json.dumps({
+            "ok": True, "id": sid, "tools": n, "servers": T.mcp_manager.status(),
+            "message": (f"บันทึก '{sid}' แล้ว — เครื่องมือของ connector "
+                        f"จะถูกถามยืนยันก่อนใช้ครั้งแรกเสมอ")}, ensure_ascii=False))
+
+    def _route_mcp_delete(self, p: dict) -> None:
+        sid = (p.get("id") or "").strip()
+        cfg = self._load_mcp_config()
+        servers = cfg.get("mcpServers", {})
+        if sid not in servers:
+            self._send(200, json.dumps({"ok": False, "message": f"ไม่พบ connector '{sid}'"},
+                                       ensure_ascii=False))
+            return
+        del servers[sid]
+        self._save_mcp_config(cfg)
+        n = T.init_mcp()
+        self._send(200, json.dumps({"ok": True, "tools": n,
+                                    "servers": T.mcp_manager.status()}, ensure_ascii=False))
+
+    def _route_schedule_run(self, p: dict) -> None:
+        """F5: รันงานตามเวลาทันที (ปุ่ม ▶ ใน UI) — รันใน background ไม่บล็อก request.
+
+        ไม่แตะ last_run (การทดสอบด้วยมือไม่ควรทำให้รอบอัตโนมัติของวันนี้ถูกข้าม).
+        """
+        sid = p.get("id") or ""
+        items = DS.load("schedules", []) or []
+        s = next((x for x in items if isinstance(x, dict) and x.get("id") == sid), None)
+        if s is None:
+            self._send(200, json.dumps({"ok": False, "message": "ไม่พบงานนี้"},
+                                       ensure_ascii=False))
+            return
+
+        def _bg(job: dict):
+            with _sched_running:
+                try:
+                    result = _run_schedule(job)
+                except Exception as e:  # noqa: BLE001
+                    result = f"ผิดพลาด: {e}"
+                    _log.warning("schedule-run '%s' failed", job.get("title"), exc_info=True)
+                cur_items = DS.load("schedules", []) or []
+                for x in cur_items:
+                    if isinstance(x, dict) and x.get("id") == sid:
+                        x["last_result"] = result
+                DS.save("schedules", cur_items)
+
+        threading.Thread(target=_bg, args=(dict(s),), daemon=True).start()
+        self._send(200, json.dumps(
+            {"ok": True, "message": "เริ่มรันแล้ว — ผลจะอยู่ในโฟลเดอร์ reports/ ของโฟลเดอร์งาน"},
+            ensure_ascii=False))
+
     def _route_confirm_skill(self, p: dict) -> None:
         """D1: ผู้ใช้กด 'อนุมัติ' skill ใหม่ → confirm แล้วรันจริง คืนผล."""
         name = p.get("name", "")
@@ -984,6 +1261,12 @@ class Handler(BaseHTTPRequestHandler):
         "/api/set-data":             "_route_set_data",
         "/api/model-info":           "_route_model_info",
         "/api/confirm-skill":        "_route_confirm_skill",   # D1
+        "/api/init-workspace":       "_route_init_workspace",  # F3
+        "/api/mcp-status":           "_route_mcp_status",      # F4
+        "/api/mcp-reload":           "_route_mcp_reload",      # F4
+        "/api/mcp-save":             "_route_mcp_save",        # F4
+        "/api/mcp-delete":           "_route_mcp_delete",      # F4
+        "/api/schedule-run":         "_route_schedule_run",    # F5
     }
 
     def do_POST(self) -> None:
@@ -1091,8 +1374,67 @@ def _bind_server() -> ThreadingHTTPServer | None:
     return None
 
 
+def _apply_window_icon(title: str = "LM Co-work") -> None:
+    """ตั้งไอคอนหน้าต่าง/taskbar บน Windows.
+
+    ทำไมต้องมี: `icon=` ใน PyInstaller spec ตั้งไอคอนให้ "ตัวไฟล์ .exe" เท่านั้น
+    แต่หน้าต่างที่ pywebview สร้าง (WinForms) ใช้ไอคอน generic ของตัวเอง ทำให้
+    ไอคอนบน taskbar ตอนรันไม่ใช่โลโก้แอป — ต้องยิง WM_SETICON ใส่ hwnd เอง.
+    รันใน background thread: รอหน้าต่างโผล่ก่อน (โพลสูงสุด 10 วิ) แล้วค่อยตั้ง.
+    """
+    if os.name != "nt":
+        return
+    ico = os.path.join(HERE, "icon.ico")
+    if not os.path.isfile(ico):
+        _log.debug("_apply_window_icon: ไม่พบ icon.ico ที่ %s", ico)
+        return
+    try:
+        import ctypes
+        hwnd = 0
+        deadline = time.time() + 10
+        while not hwnd and time.time() < deadline:
+            hwnd = ctypes.windll.user32.FindWindowW(None, title)
+            if not hwnd:
+                time.sleep(0.3)
+        if not hwnd:
+            _log.debug("_apply_window_icon: หา hwnd ของหน้าต่าง '%s' ไม่เจอ", title)
+            return
+        IMAGE_ICON, LR_LOADFROMFILE = 1, 0x0010
+        WM_SETICON, ICON_SMALL, ICON_BIG = 0x0080, 0, 1
+        for size, which in ((16, ICON_SMALL), (32, ICON_BIG)):
+            hicon = ctypes.windll.user32.LoadImageW(
+                None, ico, IMAGE_ICON, size, size, LR_LOADFROMFILE)
+            if hicon:
+                ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, which, hicon)
+    except Exception:  # noqa: BLE001
+        _log.debug("_apply_window_icon: ตั้งไอคอนไม่สำเร็จ", exc_info=True)
+
+
 def main():
+    # ให้ Windows มองแอปนี้เป็นแอปของตัวเอง (ไม่จัดกลุ่ม/ใช้ไอคอนของ host process อื่น)
+    # ต้องเรียกก่อนสร้างหน้าต่าง — มีผลกับไอคอน+การ pin บน taskbar
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("LMCoWork.App")
+        except Exception:  # noqa: BLE001
+            _log.debug("SetCurrentProcessExplicitAppUserModelID ไม่สำเร็จ", exc_info=True)
     T.set_workspace(None)  # สร้างโฟลเดอร์งานเริ่มต้น
+
+    # QUAL-5: โหลด MCP servers ใน background — ไม่บล็อกการเปิดหน้าต่าง
+    def _mcp_boot():
+        try:
+            n = T.init_mcp()
+            if n:
+                _log.info("MCP พร้อม: %d tools จาก %d server", n, len(T.mcp_manager.clients))
+        except Exception:  # noqa: BLE001
+            _log.warning("โหลด MCP ไม่สำเร็จ", exc_info=True)
+
+    threading.Thread(target=_mcp_boot, daemon=True).start()
+
+    # F5: scheduler งานตามเวลา (รันเฉพาะตอนแอปเปิดอยู่)
+    threading.Thread(target=_scheduler_loop, daemon=True).start()
+
     # สตาร์ต LM Studio server แบบ headless อัตโนมัติ (ไม่ต้องเปิดหน้าต่างแอป LM Studio)
     # ทำใน background thread เพื่อไม่บล็อกการเปิดหน้าต่าง และสตาร์ตแค่ครั้งเดียว
     if not _lm_alive():
@@ -1171,7 +1513,9 @@ def main():
                               min_size=(860, 580), text_select=True)
                               
         threading.Thread(target=start_tray, args=(window,), daemon=True).start()
-        
+        # ตั้งไอคอนหน้าต่าง/taskbar หลังหน้าต่างโผล่ (WinForms ใช้ไอคอน generic ถ้าไม่ตั้งเอง)
+        threading.Thread(target=_apply_window_icon, daemon=True).start()
+
         webview.start()
         print("\nปิดโปรแกรมแล้ว 👋")
         return

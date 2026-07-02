@@ -20,6 +20,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import sys as _sys
 import urllib.request
 import urllib.error
 import ipaddress
@@ -49,8 +50,29 @@ WORKSPACE = _DEFAULT_WS
 # (ยังกัน root ของไดรฟ์และโฟลเดอร์ระบบไว้เสมอเพื่อความปลอดภัย)
 _COWORK = False
 
-# Load MCP Config on startup
-mcp_manager.load_config(os.path.join(_BASE_DIR, "mcp.json"))
+# ---------------------------------------------------------------------------
+# MCP — config อยู่ข้างโปรแกรม (.exe ใช้ข้างไฟล์ .exe ไม่ใช่ temp ของ PyInstaller)
+# QUAL-5: เดิมโหลดตอน import ทำให้ (ก) import tools = spawn subprocess ทันที
+# (ข) startup ถูกบล็อกได้ 10s+/server (ค) pytest ก็ spawn ด้วยถ้ามี mcp.json
+# ตอนนี้ต้องเรียก init_mcp() เอง (server.main() เรียกใน background thread)
+# ---------------------------------------------------------------------------
+if getattr(_sys, "frozen", False):
+    _APP_DIR = os.path.dirname(_sys.executable)
+else:
+    _APP_DIR = _BASE_DIR
+MCP_CONFIG_PATH = os.path.join(_APP_DIR, "mcp.json")
+
+
+def init_mcp() -> int:
+    """โหลด/รีโหลด MCP servers จาก mcp.json. คืนจำนวน tools ที่ได้มา."""
+    mcp_manager.stop_all()
+    mcp_manager.load_config(MCP_CONFIG_PATH)
+    return len(mcp_manager.tool_schemas)
+
+
+def is_mcp_tool(name: str) -> bool:
+    """SEC-6: server ใช้เช็คว่า tool call นี้เป็นของ MCP (ต้องผ่าน confirm ครั้งแรก)."""
+    return name in mcp_manager.tool_mapping
 
 
 def set_cowork(flag: bool) -> None:
@@ -229,6 +251,80 @@ def write_file(path: str, content: str) -> str:
 def file_exists(path: str) -> bool:
     full = _resolve(path)
     return bool(full and os.path.isfile(full))
+
+
+# ---------------------------------------------------------------------------
+# F1: Memory files — ไฟล์คำสั่ง/ความจำประจำโฟลเดอร์งาน (inject เข้า system prompt)
+# ---------------------------------------------------------------------------
+AGENT_FILE = "_agent.md"      # คำสั่งประจำโฟลเดอร์ (ผู้ใช้เขียนเอง)
+MEMORY_FILE = "_memory.md"    # ความจำสะสม (AI เพิ่มผ่าน tool remember + ผู้ใช้แก้ได้)
+# โมเดล local context สั้น (4k–8k) — ต้อง cap ขนาดที่ inject เสมอ
+AGENT_MAX_CHARS = 4000        # _agent.md เก็บ "หัวไฟล์" (คำสั่งหลักมักอยู่ต้นไฟล์)
+MEMORY_MAX_CHARS = 3000       # _memory.md เก็บ "ท้ายไฟล์" (บันทึกใหม่สุด append ท้าย)
+
+
+def _read_ws_text(name: str) -> str:
+    """อ่านไฟล์ข้อความใน workspace แบบเงียบ — คืน '' ถ้าไม่มี/อ่านไม่ได้."""
+    full = _resolve(name)
+    if not full or not os.path.isfile(full):
+        return ""
+    try:
+        with open(full, "r", encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def workspace_context() -> str:
+    """บริบทประจำโฟลเดอร์งานสำหรับต่อท้าย system prompt (F1).
+
+    คืน '' ถ้าไม่มีทั้ง _agent.md และ _memory.md — จะไม่เปลืองบริบทของโมเดลเลย.
+    """
+    parts: list[str] = []
+    agent = _read_ws_text(AGENT_FILE)
+    if agent:
+        if len(agent) > AGENT_MAX_CHARS:
+            agent = agent[:AGENT_MAX_CHARS] + "\n…(ตัดที่ {} ตัวอักษร)".format(AGENT_MAX_CHARS)
+        parts.append(f"[คำสั่งประจำโฟลเดอร์งาน — {AGENT_FILE}]\n{agent}")
+    memory = _read_ws_text(MEMORY_FILE)
+    if memory:
+        if len(memory) > MEMORY_MAX_CHARS:
+            # เก็บท้ายไฟล์ (บันทึกล่าสุด) และตัดบรรทัดแรกที่ขาดครึ่งทิ้ง
+            memory = memory[-MEMORY_MAX_CHARS:]
+            nl = memory.find("\n")
+            if 0 <= nl < 200:
+                memory = memory[nl + 1:]
+        parts.append(f"[ความจำของโฟลเดอร์นี้ — {MEMORY_FILE}]\n{memory}")
+    return "\n\n".join(parts)
+
+
+def build_memory_content(text: str) -> str:
+    """สร้างเนื้อหา _memory.md ฉบับเต็มหลังเพิ่มบันทึกใหม่ (ใช้ทำ proposal ให้ผู้ใช้ยืนยัน).
+
+    เกินเพดานเมื่อไร ตัดบันทึกเก่าสุด (หัวไฟล์) ทิ้งก่อน — ความจำใหม่สำคัญกว่า.
+    """
+    text = (text or "").strip()
+    stamp = datetime.date.today().isoformat()
+    entry = f"- [{stamp}] {text}"
+    old = _read_ws_text(MEMORY_FILE)
+    new = (old + "\n" if old else "") + entry
+    if len(new) > MEMORY_MAX_CHARS:
+        new = new[-MEMORY_MAX_CHARS:]
+        nl = new.find("\n")
+        if 0 <= nl < 200:
+            new = new[nl + 1:]
+    return new
+
+
+def remember(text: str) -> str:
+    """จดสิ่งสำคัญลงไฟล์ความจำ _memory.md ของโฟลเดอร์งาน.
+
+    หมายเหตุ: ในเวอร์ชัน UI เครื่องมือนี้อยู่ใน WRITE_TOOLS — server จะดักเป็น proposal
+    ให้ผู้ใช้กดยืนยันก่อนเขียนจริงเสมอ (ฟังก์ชันนี้ถูกเรียกตรงเฉพาะนอก UI/ใน test).
+    """
+    if not (text or "").strip():
+        return "ไม่มีข้อความให้จำ"
+    return write_file(MEMORY_FILE, build_memory_content(text))
 
 
 def _is_public_host(host: str) -> bool:
@@ -749,10 +845,12 @@ TOOLS = {
     "install_ffmpeg": install_ffmpeg,
     "add_to_knowledge": add_to_knowledge,
     "search_knowledge": search_knowledge,
+    "remember": remember,
 }
 
 # เครื่องมือกลุ่มที่ "เขียน/แก้ไฟล์" — server จะดักไว้ถามยืนยันก่อน
-WRITE_TOOLS = {"write_file"}
+# (F1: remember ก็เขียนไฟล์ _memory.md จึงต้องผ่านการยืนยันเช่นกัน)
+WRITE_TOOLS = {"write_file", "remember"}
 
 TOOL_SCHEMAS = [
     {"type": "function", "function": {
@@ -834,6 +932,14 @@ TOOL_SCHEMAS = [
         "parameters": {"type": "object", "properties": {
             "query": {"type": "string", "description": "The search query (keywords, questions)"}
         }, "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "remember",
+        "description": ("จดข้อมูล/ข้อตกลง/ความชอบสำคัญของผู้ใช้ลงไฟล์ความจำ (_memory.md) "
+                        "ของโฟลเดอร์งาน — จะถูกอ่านอัตโนมัติทุกครั้งที่เริ่มคุยในโฟลเดอร์นี้ "
+                        "ใช้เมื่อผู้ใช้บอกให้จำ หรือพบข้อมูลที่ควรจำระยะยาว (สั้น กระชับ)"),
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string", "description": "ข้อความสั้นๆ ที่ต้องการจำ (1-2 ประโยค)"}},
+            "required": ["text"]}}},
 ]
 
 

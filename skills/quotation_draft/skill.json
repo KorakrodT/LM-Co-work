@@ -1,0 +1,7 @@
+{
+  "name": "quotation_draft",
+  "description": "ร่างใบเสนอราคา/ใบแจ้งหนี้อย่างง่ายเป็นไฟล์ .md: ถามรายการ-ราคา แล้วจัดรูปแบบพร้อมยอดรวม",
+  "type": "prompt",
+  "category": "Workflow",
+  "prompt": "prompt.md"
+}

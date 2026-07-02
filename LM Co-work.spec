@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('index.html', '.')]
+datas = [('index.html', '.'), ('icon.ico', '.')]
 binaries = []
 hiddenimports = ['clr']
 tmp_ret = collect_all('webview')

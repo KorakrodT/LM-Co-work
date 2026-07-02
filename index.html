@@ -98,10 +98,15 @@
   .skill .stype{font-size:9.5px;font-family:var(--mono);color:var(--accent);text-transform:uppercase}
   .skill.err .sn{color:var(--red)}
 
-  .side-foot{border-top:1px solid var(--border);padding:10px 12px;flex-shrink:0;display:flex;gap:8px;align-items:center}
-  .side-foot .fbtn{flex:1;background:var(--panel-2);border:1px solid var(--border);color:var(--muted);border-radius:8px;
-    padding:8px;font-size:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;transition:.14s}
-  .side-foot .fbtn:hover{color:var(--text);border-color:var(--accent)}
+  .side-foot{border-top:1px solid var(--border);padding:10px 12px;flex-shrink:0;
+    display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+  .side-foot .fbtn{background:var(--panel-2);border:1px solid var(--border);color:var(--muted);
+    border-radius:10px;padding:9px 4px 8px;font-size:10.5px;font-weight:500;cursor:pointer;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;
+    line-height:1;white-space:nowrap;overflow:hidden;transition:.14s}
+  .side-foot .fbtn .ico{width:15px;height:15px;flex-shrink:0}
+  .side-foot .fbtn:hover{color:var(--text);border-color:var(--accent);transform:translateY(-1px)}
+  .side-foot .fbtn:active{transform:translateY(0)}
 
   /* ===== Main ===== */
   .main{display:flex;flex-direction:column;min-width:0;position:relative;background:var(--bg)}
@@ -294,6 +299,7 @@
 
     <div class="side-foot">
       <button class="fbtn" onclick="scanFiles()"><svg class="ico" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>ตรวจไฟล์เสีย</button>
+      <button class="fbtn" onclick="initWorkspace()" title="สร้าง _agent.md, _memory.md และโฟลเดอร์ inbox/projects/archive (ไม่ทับของเดิม)"><svg class="ico" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>จัดโครงสร้าง</button>
       <button class="fbtn" onclick="reloadSkills()"><svg class="ico" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/></svg>Skills</button>
     </div>
   </aside>
@@ -308,6 +314,7 @@
         <span>Co-Work</span><span class="sw"></span>
       </div>
       <div class="spacer"></div>
+      <button class="icon-btn" title="บันทึกแชตนี้เป็น Skill (ใช้ซ้ำได้)" onclick="saveChatAsSkill()" style="font-size:14px">🧩</button>
       <button class="icon-btn" title="Artifacts / Log" onclick="toggleRight()" id="btnRight"><svg class="ico" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg></button>
     </div>
 
@@ -689,6 +696,16 @@ async function openFile(path){
   const r=await api("/api/readfile",{path,workspace:state.workspace});
   openArtifact(path, r.content||"(ว่าง)");
 }
+/* F3: จัดโครงสร้างโฟลเดอร์งานเริ่มต้น (_agent.md, _memory.md, inbox/, projects/, archive/) */
+async function initWorkspace(){
+  if(!confirm("สร้างโครงสร้างเริ่มต้นในโฟลเดอร์งาน?\n\n_agent.md (คำสั่งประจำโฟลเดอร์)\n_memory.md (ความจำ)\ninbox/  projects/  archive/\n\n(ไฟล์/โฟลเดอร์ที่มีอยู่แล้วจะไม่ถูกทับ)")) return;
+  const r=await api("/api/init-workspace",{workspace:state.workspace});
+  if(r.ok){
+    toast("สร้างใหม่ "+(r.created.length?r.created.join(", "):"—")+(r.skipped.length?" · มีอยู่แล้ว "+r.skipped.length+" รายการ":""));
+    loadTree("");
+  }else toast("ผิดพลาด: "+(r.error||""));
+}
+
 async function pickWorkspace(){
   if(!(window.pywebview&&window.pywebview.api&&window.pywebview.api.pick_folder)){ toast("ใช้เลือกโฟลเดอร์ได้เฉพาะในแอป (.exe)"); return; }
   const path=await window.pywebview.api.pick_folder(); if(!path) return;
@@ -702,17 +719,127 @@ async function pickWorkspace(){
  * ============================================================= */
 function renderSkills(){
   const p=$("pane-skills");
-  if(!state.skills.length){ p.innerHTML='<div class="empty">ยังไม่มี skill<br>วางโฟลเดอร์ใน skills/ แล้วกด ⟳</div>'; return; }
   const ic={code:IC.wrench,prompt:IC.book,both:IC.toolkit,error:IC.alert};
-  p.innerHTML=state.skills.map(s=>`<div class="skill ${s.error?"err":""}">
-    <span class="si">${ic[s.type]||IC.toolkit}</span>
-    <div><div class="sn">${esc(s.name)} <span class="stype">${esc(s.type)}</span></div>
-    <div class="sd">${esc(s.error||s.description||"")}</div></div></div>`).join("");
+  let html = state.skills.length
+    ? state.skills.map(s=>`<div class="skill ${s.error?"err":""}">
+        <span class="si">${ic[s.type]||IC.toolkit}</span>
+        <div><div class="sn">${esc(s.name)} <span class="stype">${esc(s.type)}</span></div>
+        <div class="sd">${esc(s.error||s.description||"")}</div></div></div>`).join("")
+    : '<div class="empty">ยังไม่มี skill<br>วางโฟลเดอร์ใน skills/ แล้วกด ⟳</div>';
+  // F4: ส่วน MCP Connectors ต่อท้ายรายการ skills
+  html += '<div id="mcpBox" style="margin-top:10px"></div>';
+  // F5: งานตามเวลา
+  html += '<div id="schedBox" style="margin-top:10px"></div>';
+  p.innerHTML=html;
+  loadMcp();
+  loadSched();
 }
 async function reloadSkills(){
   const r=await api("/api/reload-skills",{});
   state.skills=r.skills||[]; renderSkills(); toast("โหลด skills ใหม่: "+(r.count||0)+" รายการ");
 }
+
+/* ---------- F2: บันทึกแชตปัจจุบันเป็น prompt skill ---------- */
+async function saveChatAsSkill(){
+  const c=cur();
+  if(!c||!c.messages.length){ toast("ยังไม่มีบทสนทนาให้บันทึก"); return; }
+  const firstUser=(c.messages.find(m=>m.role==="user")||{}).content||"";
+  const lastAi=[...c.messages].reverse().find(m=>m.role==="assistant");
+  if(!lastAi||!lastAi.content){ toast("ยังไม่มีคำตอบของ AI ในแชตนี้"); return; }
+  const name=prompt("ตั้งชื่อ Skill (อังกฤษ a-z, 0-9, _):","my_workflow"); if(!name) return;
+  const ptxt="# Workflow ที่บันทึกจากแชต: "+(c.title||"")+"\n\n"
+    +"## โจทย์ตัวอย่าง\n"+firstUser+"\n\n"
+    +"## แนวทาง/ผลลัพธ์ที่ใช้ได้ผล\n"+lastAi.content+"\n\n"
+    +"## คำสั่ง\nเมื่อผู้ใช้ขอสิ่งที่คล้ายโจทย์ตัวอย่างข้างบน ให้ทำตามแนวทางเดียวกัน "
+    +"ปรับรายละเอียดตามคำขอใหม่ของผู้ใช้";
+  const r=await api("/api/create-skill",{name,description:"บันทึกจากแชต: "+(c.title||""),
+    type:"prompt",prompt_text:ptxt,category:"Workflow"});
+  if(r.ok){ state.skills=r.skills||state.skills; renderSkills(); toast("บันทึกเป็น Skill '"+(r.message||name)+"' แล้ว ✅"); }
+  else toast("ผิดพลาด: "+(r.message||""));
+}
+
+/* ---------- F4: MCP Connectors ---------- */
+async function loadMcp(){
+  let r; try{ r=await api("/api/mcp-status",{}); }catch(e){ return; }
+  state.mcp=r; renderMcp();
+}
+function renderMcp(){
+  const host=$("mcpBox"); if(!host) return;
+  const r=state.mcp||{servers:[]};
+  let html='<div style="display:flex;align-items:center;gap:6px;padding:4px 2px;color:var(--muted);font-size:12px;font-weight:600">🔌 MCP Connectors'
+    +'<button class="icon-btn" style="width:22px;height:22px;margin-left:auto" title="รีโหลด" onclick="reloadMcp()">⟳</button>'
+    +'<button class="icon-btn" style="width:22px;height:22px" title="เพิ่ม connector" onclick="addMcp()">＋</button></div>';
+  const servers=r.servers||[];
+  if(!servers.length){
+    html+='<div class="empty" style="padding:6px;font-size:12px">ยังไม่มี — กด ＋ เพิ่ม<br>หรือวางไฟล์ mcp.json ข้างโปรแกรมแล้วกด ⟳</div>';
+  }
+  servers.forEach(s=>{
+    const tools=(s.tools||[]).length;
+    html+=`<div class="skill"><span class="si">${s.running?"🟢":"🔴"}</span>
+      <div><div class="sn">${esc(s.id)}</div>
+      <div class="sd">${s.error?("⚠️ "+esc(s.error)):(tools+" tools"+(s.name?" · "+esc(s.name):""))}</div></div>
+      <span class="del" data-mcp-id="${esc(s.id)}" title="ลบ" style="cursor:pointer">🗑</span></div>`;
+  });
+  host.innerHTML=html;
+  host.querySelectorAll("[data-mcp-id]").forEach(b=>b.addEventListener("click",()=>delMcp(b.dataset.mcpId)));
+}
+async function reloadMcp(){ const r=await api("/api/mcp-reload",{}); state.mcp=r; renderMcp(); toast("รีโหลด MCP แล้ว ("+(r.tools||0)+" tools)"); }
+async function addMcp(){
+  const id=prompt("ตั้งชื่อ connector (อังกฤษ เช่น gmail):"); if(!id) return;
+  const command=prompt("คำสั่งรัน (เช่น npx หรือ path ไฟล์ .exe):"); if(!command) return;
+  const args=prompt("arguments (คั่นด้วยเว้นวรรค เช่น -y @modelcontextprotocol/server-filesystem):")||"";
+  const r=await api("/api/mcp-save",{id,command,args});
+  toast(r.ok?(r.message||"เพิ่มแล้ว"):("ผิดพลาด: "+(r.message||"")));
+  loadMcp();
+}
+async function delMcp(id){
+  if(!confirm("ลบ connector '"+id+"' ออกจาก mcp.json?")) return;
+  const r=await api("/api/mcp-delete",{id});
+  toast(r.ok?"ลบแล้ว":("ผิดพลาด: "+(r.message||"")));
+  loadMcp();
+}
+
+/* ---------- F5: งานตามเวลา (Scheduled tasks) ---------- */
+async function loadSched(){ state.sched=(await loadData("schedules"))||[]; renderSched(); }
+function renderSched(){
+  const host=$("schedBox"); if(!host) return;
+  let html='<div style="display:flex;align-items:center;gap:6px;padding:4px 2px;color:var(--muted);font-size:12px;font-weight:600">⏰ งานตามเวลา'
+    +'<button class="icon-btn" style="width:22px;height:22px;margin-left:auto" title="เพิ่มงาน" onclick="addSched()">＋</button></div>';
+  const items=state.sched||[];
+  if(!items.length){
+    html+='<div class="empty" style="padding:6px;font-size:12px">ยังไม่มี — กด ＋ ตั้งงานประจำ<br>เช่น "สรุปโฟลเดอร์ทุกเช้า 08:30"<br>(รันเฉพาะตอนแอปเปิดอยู่)</div>';
+  }
+  items.forEach((s,i)=>{
+    html+=`<div class="skill"><span class="si">${s.enabled!==false?"🟢":"⏸️"}</span>
+      <div><div class="sn">${esc(s.title||"งาน")}</div>
+      <div class="sd">ทุกวัน ${esc(s.time||"?")}${s.last_run?" · รันล่าสุด "+esc(s.last_run):""}${s.last_result?" → "+esc(s.last_result):""}</div></div>
+      <span data-sched-run="${i}" title="รันเดี๋ยวนี้" style="cursor:pointer">▶</span>
+      <span data-sched-tgl="${i}" title="เปิด/พัก" style="cursor:pointer;margin-left:6px">⏯</span>
+      <span data-sched-del="${i}" title="ลบ" style="cursor:pointer;margin-left:6px">🗑</span></div>`;
+  });
+  host.innerHTML=html;
+  host.querySelectorAll("[data-sched-run]").forEach(b=>b.addEventListener("click",()=>runSchedNow(+b.dataset.schedRun)));
+  host.querySelectorAll("[data-sched-tgl]").forEach(b=>b.addEventListener("click",()=>tglSched(+b.dataset.schedTgl)));
+  host.querySelectorAll("[data-sched-del]").forEach(b=>b.addEventListener("click",()=>delSched(+b.dataset.schedDel)));
+}
+function saveSched(){ saveData("schedules",state.sched||[]); renderSched(); }
+function addSched(){
+  const title=prompt("ชื่องาน (เช่น สรุปโฟลเดอร์ทุกเช้า):"); if(!title) return;
+  const time=(prompt("เวลา (HH:MM):","08:30")||"").trim();
+  if(!/^\d{1,2}:\d{2}$/.test(time)){ toast("รูปแบบเวลาไม่ถูกต้อง (ต้องเป็น HH:MM)"); return; }
+  const ptxt=prompt("คำสั่งที่จะให้ AI ทำ (ผลลัพธ์จะถูกเขียนลง reports/ อัตโนมัติ):"); if(!ptxt) return;
+  state.sched=state.sched||[];
+  state.sched.push({id:uid(),title:title.trim(),time,prompt:ptxt,agent:state.agentKey,
+                    workspace:state.workspace,enabled:true});
+  saveSched(); toast("เพิ่มงานแล้ว — จะรันอัตโนมัติเมื่อถึงเวลา (ตอนแอปเปิดอยู่)");
+}
+async function runSchedNow(i){
+  const s=(state.sched||[])[i]; if(!s) return;
+  const r=await api("/api/schedule-run",{id:s.id});
+  toast(r.message||(r.ok?"เริ่มแล้ว":"ผิดพลาด"));
+}
+function tglSched(i){ const s=(state.sched||[])[i]; if(!s) return; s.enabled=s.enabled===false; saveSched(); }
+function delSched(i){ const s=(state.sched||[])[i]; if(!s) return; if(!confirm("ลบงาน '"+(s.title||"")+"'?")) return; state.sched.splice(i,1); saveSched(); }
 
 /* ============================================================= *
  *  Audio / file-integrity scan → tool card

@@ -20,7 +20,7 @@ else:
 DATA_DIR = os.path.join(_BASE, "data")
 
 # คีย์ที่อนุญาตให้บันทึก/อ่านผ่าน endpoint เท่านั้น
-ALLOWED = {"chats", "projects", "settings"}
+ALLOWED = {"chats", "projects", "settings", "schedules"}  # F5: งานตามเวลา
 
 
 def _path(key: str) -> str:

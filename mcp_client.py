@@ -5,6 +5,8 @@ import uuid
 import os
 import logging
 
+import winproc  # ซ่อนหน้าต่าง console ของ MCP subprocess บน Windows
+
 _log = logging.getLogger(__name__)
 
 class MCPClient:
@@ -33,11 +35,15 @@ class MCPClient:
                 env=self.env,
                 text=True,
                 bufsize=1, # line buffered
-                encoding='utf-8'
+                encoding='utf-8',
+                **winproc.no_window_kwargs()
             )
             self.is_running = True
             self.reader_thread = threading.Thread(target=self._read_loop, daemon=True)
             self.reader_thread.start()
+            # QUAL-5: ต้องมีคนอ่าน stderr เสมอ — ไม่งั้น MCP server ที่พ่น log มากๆ
+            # จะเต็ม pipe buffer แล้วค้างทั้งโปรเซส (deadlock คลาสสิก)
+            threading.Thread(target=self._stderr_loop, daemon=True).start()
             
             # Send initialize
             init_res = self.send_request("initialize", {
@@ -75,28 +81,42 @@ class MCPClient:
             except subprocess.TimeoutExpired:
                 self.process.kill()
 
+    def _stderr_loop(self):
+        """QUAL-5: อ่าน stderr ของ MCP server ทิ้ง (พร้อม log debug) กัน pipe เต็มจน deadlock."""
+        try:
+            for line in self.process.stderr:
+                line = line.strip()
+                if line:
+                    _log.debug("MCP[%s] stderr: %s", self.server_name or self.command, line)
+        except Exception:  # noqa: BLE001 — pipe ปิดตอนโปรเซสจบเป็นเรื่องปกติ
+            pass
+
     def _read_loop(self):
         while self.is_running and self.process and self.process.poll() is None:
             try:
                 line = self.process.stdout.readline()
                 if not line:
                     break
-                
+
                 line = line.strip()
                 if not line:
                     continue
-                    
+
                 data = json.loads(line)
-                
+
                 if "id" in data and ("result" in data or "error" in data):
                     req_id = data["id"]
-                    self.responses[req_id] = data
+                    # QUAL-5: เก็บเฉพาะ response ที่ยังมีคนรอ — response ที่มาช้ากว่า
+                    # timeout (event ถูกถอดไปแล้ว) ทิ้งเลย ไม่งั้นค้างใน dict ตลอดชีพ
                     if req_id in self.response_events:
+                        self.responses[req_id] = data
                         self.response_events[req_id].set()
+                    else:
+                        _log.debug("MCP response ตกค้าง (เลย timeout) ถูกทิ้ง: %s", req_id)
                 elif "method" in data:
                     # Handle notifications from server
                     _log.debug(f"Received MCP notification: {data}")
-                    
+
             except Exception as e:
                 _log.error(f"Error reading MCP response: {e}")
 
@@ -134,7 +154,8 @@ class MCPClient:
         else:
             _log.error(f"MCP request timeout: {method}")
             self.response_events.pop(req_id, None)
-            
+            self.responses.pop(req_id, None)   # QUAL-5: กัน response ที่มาช้าค้างใน dict
+
         return None
 
     def send_notification(self, method, params):
@@ -176,6 +197,21 @@ class MCPManager:
         self.clients = {} # id -> MCPClient
         self.tool_schemas = []
         self.tool_mapping = {} # tool_name -> client_id
+        self.errors = {}  # id -> ข้อความ error ตอนสตาร์ต (F4: โชว์ใน UI ได้)
+
+    def status(self) -> list[dict]:
+        """F4: สถานะทุก server สำหรับแสดงใน UI."""
+        out = []
+        for sid, c in self.clients.items():
+            running = bool(c.process and c.process.poll() is None)
+            out.append({"id": sid, "name": c.server_name, "version": c.server_version,
+                        "running": running,
+                        "tools": [t.get("name", "") for t in c.tools]})
+        for sid, err in self.errors.items():
+            if sid not in self.clients:
+                out.append({"id": sid, "name": "", "version": "", "running": False,
+                            "tools": [], "error": err})
+        return out
 
     def load_config(self, config_path):
         if not os.path.exists(config_path):
@@ -195,7 +231,10 @@ class MCPManager:
                 env.update(env_updates)
                 
                 client = MCPClient(command, args, env)
-                if client.start():
+                if not client.start():
+                    self.errors[server_id] = f"สตาร์ตไม่สำเร็จ (command: {command})"
+                    client.stop()
+                else:
                     self.clients[server_id] = client
                     _log.info(f"Started MCP server: {server_id}")
                     
@@ -223,6 +262,7 @@ class MCPManager:
         self.clients.clear()
         self.tool_schemas.clear()
         self.tool_mapping.clear()
+        self.errors.clear()
 
     def call_tool(self, tool_name, arguments):
         client_id = self.tool_mapping.get(tool_name)

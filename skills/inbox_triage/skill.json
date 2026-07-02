@@ -1,0 +1,7 @@
+{
+  "name": "inbox_triage",
+  "description": "คัดกรองไฟล์ใน inbox/: แยกประเภท เสนอย้ายเข้า projects/ หรือ archive/ พร้อมเหตุผล",
+  "type": "prompt",
+  "category": "Workflow",
+  "prompt": "prompt.md"
+}
