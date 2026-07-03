@@ -58,8 +58,10 @@ def _load() -> dict:
 
 def _save(d: dict) -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(STORE_PATH, "w", encoding="utf-8") as f:
+    tmp = STORE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STORE_PATH)
 
 
 def _clean(data: dict) -> dict:

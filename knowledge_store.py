@@ -32,8 +32,10 @@ class SimpleVectorStore:
             self.documents = []
 
     def save(self):
-        with open(self.data_file, 'w', encoding='utf-8') as f:
+        tmp = self.data_file + ".tmp"
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(self.documents, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.data_file)
 
     def add_document(self, doc_id: str, content: str, metadata: dict = None):
         self._ensure_loaded()

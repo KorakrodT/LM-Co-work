@@ -451,7 +451,7 @@ def test_post_route_table_has_all_known_routes():
         "/api/readfile", "/api/get-agent", "/api/save-agent",
         "/api/delete-agent", "/api/get-data", "/api/set-data",
         "/api/model-info", "/api/audio-scan",
-        "/api/chat-stream", "/api/cancel",   # B1+B2
+        "/api/cancel",   # B2
     }
     missing = required - set(table.keys())
     assert not missing, f"missing routes: {missing}"
@@ -519,15 +519,6 @@ def test_do_post_route_exception_returns_500(monkeypatch):
     assert sent.get("code") == 500
     assert "boom" in sent.get("body", "")
 
-
-# --------------------------------------------------------------------------
-# 13) B1: /api/chat-stream route ลงทะเบียนในตาราง
-# --------------------------------------------------------------------------
-def test_chat_stream_route_registered():
-    _stub_optional_deps()
-    server = importlib.import_module("server")
-    assert "/api/chat-stream" in server.Handler._POST_ROUTE_TABLE
-    assert hasattr(server.Handler, "_route_chat_stream")
 
 
 # --------------------------------------------------------------------------

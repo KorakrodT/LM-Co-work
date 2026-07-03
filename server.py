@@ -391,32 +391,6 @@ def _openai_chat(base_url, api_key, model, messages, tools):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _openai_chat_stream(base_url, api_key, model, messages, tools):
-    """B1: เรียกโมเดลแบบ streaming (stream=True) คืน generator ที่ yield SSE line ทีละบรรทัด.
-
-    แต่ละ yield เป็น bytes ในรูปแบบ SSE: ``data: <json>\n\n``
-    yield ``data: [DONE]\n\n`` เมื่อจบ (ตามมาตรฐาน OpenAI streaming).
-    """
-    url = base_url.rstrip("/") + "/chat/completions"
-    payload = {"model": model, "messages": messages, "stream": True}
-    if tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = "auto"
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
-                                 method="POST", headers=headers)
-    with urllib.request.urlopen(req, timeout=120) as resp:  # noqa: S310
-        for raw_line in resp:
-            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-            if not line:
-                continue
-            yield (line + "\n\n").encode("utf-8")
-            if line == "data: [DONE]":
-                break
-
-
 # ---- cancel flag สำหรับ B2: ปุ่มหยุด ----
 _cancel_lock = threading.Lock()
 _cancel_requested = False
@@ -458,6 +432,18 @@ def run_agent(agent_key: str, history: list, model: str,
     catalog = T.skills_catalog(allowed_cats)
     if catalog:
         sys_prompt += "\n\n" + catalog
+    # SI-1: ผูกงานปัจจุบันกับ decision trail + ป้อนประสบการณ์ skill กลับให้โมเดล
+    try:
+        import skill_intelligence as SI
+        _last_user = next((h.get("content", "") for h in reversed(history)
+                           if h.get("role", "user") == "user"), "")
+        SI.set_current_task(_last_user)
+        if catalog:  # มี skills ให้เลือก จึงค่อยใส่สถิติ (ไม่มี skill = ไม่เปลืองบริบท)
+            _exp = SI.experience_context(_last_user)
+            if _exp:
+                sys_prompt += "\n\n" + _exp
+    except Exception:  # noqa: BLE001
+        pass
     # F1: บริบทประจำโฟลเดอร์งาน (_agent.md/_memory.md) — ว่าง = ไม่เปลืองบริบทโมเดล
     ws_ctx = T.workspace_context()
     if ws_ctx:
@@ -521,7 +507,12 @@ def run_agent(agent_key: str, history: list, model: str,
             fn = tc.get("function", {})
             fname = fn.get("name", "")
             raw = fn.get("arguments") or "{}"
-            args = raw if isinstance(raw, dict) else json.loads(raw or "{}")
+            try:
+                args = raw if isinstance(raw, dict) else json.loads(raw or "{}")
+            except ValueError as e:
+                err_msg = f"⚠️ Error parsing tool arguments: {e}. Please provide valid JSON."
+                messages.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": err_msg})
+                continue
             result = _handle_tool_call(fname, args, used_tools, proposals, skill_names)
             messages.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": result})
     return {"reply": "ทำงานหลายขั้นเกินกำหนด", "tools": used_tools, "proposals": proposals}
@@ -823,59 +814,6 @@ class Handler(BaseHTTPRequestHandler):
                            cowork=p.get("cowork", False),
                            provider=p.get("provider"))
         self._send(200, json.dumps(result, ensure_ascii=False))
-
-    def _route_chat_stream(self, p: dict) -> None:
-        """B1: streaming endpoint — ส่ง SSE chunks กลับทีละชิ้น."""
-        T.set_cowork(p.get("cowork", False))
-        if p.get("workspace"):
-            T.set_workspace(p["workspace"])
-        _agents = AG.all_agents()
-        agent_key = p.get("agent", DEFAULT_AGENT)
-        agent = _agents.get(agent_key) or _agents.get(DEFAULT_AGENT) or AGENTS[DEFAULT_AGENT]
-        sys_prompt = agent["system"]
-        sys_prompt += ARTIFACTS_PROMPT  # ให้ตรงกับ run_agent (เดิม streaming ไม่ได้ใส่)
-        if p.get("cowork"):
-            sys_prompt += COWORK_PROMPT
-        allowed_cats = agent.get("skill_categories")
-        catalog = T.skills_catalog(allowed_cats)
-        if catalog:
-            sys_prompt += "\n\n" + catalog
-        ws_ctx = T.workspace_context()  # F1: ให้ตรงกับ run_agent
-        if ws_ctx:
-            sys_prompt += "\n\n" + ws_ctx
-        tool_schemas = schemas_for(agent, p.get("cowork", False))
-        provider = p.get("provider")
-        if provider and provider.get("base_url"):
-            base_url = provider["base_url"].rstrip("/")
-            api_key = provider.get("api_key", "")
-        else:
-            base_url = LMSTUDIO_BASE
-            api_key = LMSTUDIO_KEY
-        model = p.get("model", MODEL) or default_model()
-        messages = [{"role": "system", "content": sys_prompt}]
-        messages += [{"role": h.get("role", "user"), "content": h.get("content", "")}
-                     for h in p.get("messages", [])]
-        # ส่ง SSE header
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
-        try:
-            _clear_cancel()
-            for chunk in _openai_chat_stream(base_url, api_key, model, messages, tool_schemas):
-                if _is_cancelled():
-                    self.wfile.write(b"data: {\"cancelled\": true}\n\n")
-                    break
-                self.wfile.write(chunk)
-                self.wfile.flush()
-        except Exception as e:  # noqa: BLE001
-            _log.warning("chat-stream error: %s", e, exc_info=True)
-            try:
-                self.wfile.write(
-                    ("data: " + json.dumps({"error": str(e)}) + "\n\n").encode("utf-8"))
-            except Exception:  # noqa: BLE001
-                pass
 
     def _route_cancel(self, p: dict) -> None:  # noqa: ARG002
         """B2: หยุด run_agent ที่กำลังทำงานอยู่."""
@@ -1241,7 +1179,6 @@ class Handler(BaseHTTPRequestHandler):
     _POST_ROUTE_TABLE: dict[str, str] = {
         "/api/audio-scan":           "_route_audio_scan",
         "/api/chat":                 "_route_chat",
-        "/api/chat-stream":          "_route_chat_stream",
         "/api/cancel":               "_route_cancel",
         "/api/apply":                "_route_apply",
         "/api/upload":               "_route_upload",

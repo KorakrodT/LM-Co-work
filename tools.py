@@ -963,19 +963,47 @@ def all_tool_schemas(allowed_categories=None) -> list:
     return schemas
 
 
+def _record_skill_use(name: str, ok: bool, error: str, started: float, kind: str) -> None:
+    """SI-1: บันทึกการใช้ skill/MCP เป็น decision trail (เงียบเสมอ — ห้ามพังงานหลัก)."""
+    try:
+        import skill_intelligence as SI
+        import time as _t
+        SI.record_use(name, ok=ok, error=error, duration=_t.time() - started, kind=kind)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def run_tool(name: str, args: dict) -> str:
     """เรียกเครื่องมือพื้นฐาน, skill หรือ MCP tool ตามชื่อ."""
+    import time as _t
     if name in mcp_manager.tool_mapping:
-        return mcp_manager.call_tool(name, args)
-        
+        started = _t.time()
+        try:
+            result = mcp_manager.call_tool(name, args)
+            _record_skill_use(name, ok=True, error="", started=started, kind="mcp")
+            return result
+        except Exception as e:  # noqa: BLE001
+            _record_skill_use(name, ok=False, error=str(e), started=started, kind="mcp")
+            raise
+
     fn = TOOLS.get(name)
+    is_skill = False
     if fn is None and SKILLS:
         fn = SKILLS.tool_map().get(name)
+        is_skill = fn is not None
     if fn is None:
         return f"ไม่รู้จักเครื่องมือ: {name}"
+    started = _t.time()
     try:
-        return str(fn(**args))
+        result = str(fn(**args))
+        if is_skill:  # บันทึกเฉพาะ skills — ไม่บันทึกเครื่องมือพื้นฐาน (ลด noise)
+            kind = "prompt_skill" if name == "use_skill" else "skill"
+            _record_skill_use(name, ok=True, error="", started=started, kind=kind)
+        return result
     except Exception as e:  # noqa: BLE001
+        if is_skill:
+            kind = "prompt_skill" if name == "use_skill" else "skill"
+            _record_skill_use(name, ok=False, error=str(e), started=started, kind=kind)
         return f"เครื่องมือ {name} ผิดพลาด: {e}"
 
 
