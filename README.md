@@ -1,3 +1,213 @@
+**🤝 LM Co-work**
+
+An AI Agent that runs entirely locally on your machine via LM Studio, supporting tool calling — the model autonomously decides which tools to invoke (calculations, checking the time, reading/writing files, fetching web data, scanning for corrupt audio files), and uses the results to formulate a response. No internet connection to external APIs is required.
+
+The app communicates with LM Studio via an OpenAI-compatible server at `http://localhost:1234/v1` and will automatically start the server in headless mode when the app is launched — there is no need to open the LM Studio window manually.
+
+### Files in the Project
+
+* **`server.py`**: The main program — web server + agent loop + LM Studio integration + UI window.
+* **`index.html`**: Claude-style chat interface (blue theme).
+* **`agents.py`**: Defines each agent's persona (add/edit agents here).
+* **`tools.py`**: Tools that agents can call (add new tools here).
+* **`agent_store.py`**: Saves/loads custom agents created by the user.
+* **`skills_loader.py`**: System for loading skills from the `skills/` folder.
+* **`data_store.py`**: Stores local settings/data (in `data/`).
+* **`requirements.txt`**: Required Python libraries (`pywebview`, `pythonnet`).
+* **`run-ui.bat`**: Opens the UI from the script (double-click to run).
+* **`build-ui.bat` / `LM Co-work.spec**`: Builds the `dist\LM Co-work.exe` executable file.
+* **`icon.ico` / `icon.png**`: Application icons.
+
+---
+
+### Available Agents
+
+| Persona Name | Role | Tools Used |
+| --- | --- | --- |
+| **general** | 🧠 General Assistant | All tools (including corrupt audio scanner) |
+| **coder** | 💻 Coding Assistant | Read/write files, calculate |
+| **writer** | ✍️ Writing Assistant | Read/write files |
+| **tutor** | 📚 Tutor | Calculate, time |
+| **skill_builder** | 🛠️ Skill Builder | Read/write files |
+| **translator** | 🌐 Translator | — |
+
+---
+
+### Installation
+
+1. **Install LM Studio** — Download from [https://lmstudio.ai](https://lmstudio.ai) and launch it at least once.
+2. **Download a tool-calling supported model** — In the Discover page of LM Studio, download a model like `Qwen2.5-7B-Instruct` or `Llama-3.1-8B-Instruct` (models that support tool calling work best with this app).
+3. **Install the lms CLI (One-time)** — To allow the app to automatically start the headless server:
+```bash
+npx lmstudio install-cli
+
+```
+
+
+*(Opening LM Studio usually installs the lms CLI automatically. This step just ensures it is there.)*
+4. **Install Python packages and run the program:**
+```bash
+py -m pip install -r requirements.txt
+py server.py
+
+```
+
+
+> **⚠️ Note:** Use `py`, not `python` — as `python` on this machine points to another app's venv.
+
+
+
+---
+
+### No Need to Open LM Studio Manually
+
+When opening the LM Co-work app, it will:
+
+* Check if the LM Studio server (`localhost:1234`) is running.
+* If not → Automatically execute `lms server start` in the background (headless, no console window popping up).
+* The model will be automatically loaded (JIT) during the first chat interaction.
+* If connection fails during chat, the system will attempt to auto-start and retry (starts only once per run to avoid duplicate processes).
+* **Prerequisites:** `lms` CLI installed on the machine + at least 1 downloaded model in LM Studio.
+
+---
+
+### UI Version — Standalone `.exe` Window
+
+**Build as `.exe` (Recommended):**
+
+* Double-click `build-ui.bat` → Generates `dist\LM Co-work.exe`.
+* Double-click `LM Co-work.exe` to open the actual standalone program window (you can drag a shortcut to the Desktop).
+* Requires Microsoft Edge WebView2 Runtime (pre-installed on Windows 11; if missing, the program will prompt you to install it for free from Microsoft) — The `.exe` mode will **never** open a browser.
+
+**Or run from script (also opens as a standalone window):**
+
+* Double-click `run-ui.bat` (It will install `pywebview` and open the window).
+
+---
+
+### What's in the UI
+
+* **Standalone Window** via `pywebview` (WebView2) — Not a browser tab.
+* **Chat / Cowork / Code Mode Tabs** at the top (mapped to agents) in a Claude-like style.
+* **Chat History / Multiple Chats** — Left sidebar stores all chats. Click "✚ New Chat" / click to switch / 🗑 delete (stored locally).
+* **Projects** — Workspace folder hub. Add/search/select to set as a workspace.
+* **Path Management** — 📂 button opens the actual Windows folder picker.
+* **File Panel (Right Sidebar)** — 🗂 button to browse files within the workspace. Click to view contents.
+* **Model Selector** in the input field (Automatically fetches the list from LM Studio).
+* **Agent Selector** via dropdown.
+* **Markdown Responses** (Headers, lists, bold text, code blocks + copy button).
+* Press `Enter` to send / `Shift+Enter` for a new line.
+
+---
+
+### 🎵 Corrupt Audio File Detection
+
+The app provides a tool for the AI to scan for "corrupt" audio files within a folder. It decodes the entire file using `ffmpeg`. If decoding results in an error (or the file is empty/unopenable), it gets reported as corrupt — catching issues even if the header looks normal but the audio data is broken halfway (e.g., incomplete downloads, bad sectors).
+
+Simply type in the chat, e.g., *"Check corrupt music files in folder E:\music\Wav for me"* (Switch to Co-Work mode to scan folders outside the workspace).
+
+**Related Tools:**
+
+* `check_audio_integrity`: Scans the folder + decodes all audio files with ffmpeg and reports corrupt ones.
+* `check_ffmpeg`: Checks if ffmpeg exists on the machine.
+* `install_ffmpeg`: Automatically installs ffmpeg via winget (Windows) if missing.
+* Supports mp3, flac, wav, m4a, aac, ogg, opus, wma, aiff, etc.
+* Requires `ffmpeg` on the machine. If you don't have it, just tell the AI to *"install ffmpeg for me"*, and it will automatically run `winget install --id Gyan.FFmpeg -e`.
+
+---
+
+### 🧩 Skills — Create Your Own Agent Abilities
+
+Agents have "skills" that you can create yourself. There are 2 types (or a mix of both):
+
+1. **Code Skill**: Python functions the agent actually calls (e.g., word count, API calls, unit conversions).
+2. **Prompt Skill**: Specific instructions/domain knowledge injected for the agent to follow.
+
+**How to create:** Place 1 folder inside `skills/<name>/` containing `skill.json` (mandatory) + `tool.py` and/or `prompt.md`. See the full format and examples in `skills/README.md`.
+
+* The UI sidebar displays a list of skills. Click the ⟳ button to reload after adding/editing a skill, or use the 🛠️ **Skill Builder** agent to help write the skill files.
+* If using the `.exe` version, place the `skills/` folder next to the `.exe` file (`build-ui.bat` automatically copies it to `dist\skills`).
+
+---
+
+### Co-Work Features
+
+* **Workspace Folders** — Set a folder for the AI to read/write. The AI operates exclusively within this folder for safety (Enable Co-Work mode to unlock access to any folder, like other drives).
+* **Attach Files 📎** — Click the paperclip button to attach text files into the workspace, allowing the AI to read the content instantly.
+* **Confirm Before Writing** — When the AI attempts to create or edit a file, it displays a preview card with ✅ **Save** / ❌ **Do Not Save** buttons. The file is written *only* when you confirm (if overwriting, the system automatically backs up the old file as `.bak`).
+
+---
+
+### Change / Configure Models
+
+Can be set via environment variables:
+
+```powershell
+# Windows PowerShell
+$env:LMSTUDIO_MODEL="qwen2.5-7b-instruct"; py server.py
+
+```
+
+| Variable | Description |
+| --- | --- |
+| **LMSTUDIO_BASE_URL** | LM Studio server address (Default: `http://localhost:1234/v1`) |
+| **LMSTUDIO_MODEL** | The model to use (Leave blank = Auto-uses the first model loaded in LM Studio) |
+| **LMSTUDIO_API_KEY** | LM Studio does not verify keys — enter anything |
+
+*(Alternatively, you can select the model directly via the UI, which automatically fetches the list from LM Studio).*
+
+---
+
+### Other External Providers (Optional)
+
+Aside from LM Studio, you can add other OpenAI-compatible providers in the "Manage Models / Provider" page, such as OpenAI, OpenRouter, Groq, vLLM — simply input the Base URL ending in `/v1` + API key.
+
+---
+
+### Adding Custom Tools
+
+Open `tools.py` and do 3 things:
+
+1. Write the function:
+```python
+def get_weather(city: str) -> str:
+    return f"The weather in {city} is clear"  # Can connect to a real API
+
+```
+
+
+2. Add to `TOOLS`: `"get_weather": get_weather`
+3. Add the schema to `TOOL_SCHEMAS` (copy an existing one and modify the name/parameters).
+
+The agent will immediately recognize the new tool on the next run.
+
+---
+
+### Adding Custom Agents
+
+Open `agents.py`, copy a block inside `AGENTS`, and modify the values, for example:
+
+```python
+"lawyer": {
+    "title": "⚖️ Legal Assistant",
+    "description": "Explains basic legal matters",
+    "system": "You are a legal assistant. Reply in Thai...",
+    "tools": ["read_file"],   # None = all tools, [] = none
+},
+
+```
+
+Run `py server.py` again, and the new agent will instantly appear in the menu.
+
+---
+
+### Notes
+
+* Everything runs locally on your machine. No data leaves your computer.
+* The first time you download a model in LM Studio, it will take some time (several GBs).
+* `read_file` / `write_file` are restricted to the workspace folder for security.
+* **You must have a tool-calling supported model in LM Studio.** This app heavily relies on tool calling.
+
 # 🤝 LM Co-work
 
 AI Agent ที่รันโลคอลทั้งหมดบนเครื่องคุณ ผ่าน [LM Studio](https://lmstudio.ai)
